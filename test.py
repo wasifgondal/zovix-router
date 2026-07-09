@@ -7,7 +7,7 @@ import anthropic
 import os
 
 # Paste your key here just for testing
-API_KEY = os.environ.get("ANTHROPIC_API_KEY", "YOUR_KEY_HERE")
+API_KEY = os.environ.get("ANTHROPIC_API_KEY", "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")
 
 client = anthropic.Anthropic(api_key=API_KEY)
 
