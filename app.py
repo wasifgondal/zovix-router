@@ -41,11 +41,14 @@ def is_definitely_sensitive(text):
 # ── SLACK VERIFICATION ───────────────────────────────────
 def verify_slack_signature(request_body, timestamp, signature):
     """Verify the request actually comes from Slack."""
+    signing_secret = os.environ.get("SLACK_SIGNING_SECRET", "")
+    if not signing_secret:
+        return True  # Skip verification if secret not set
     if abs(time.time() - int(timestamp)) > 60 * 5:
         return False
     sig_basestring = f"v0:{timestamp}:{request_body}"
     computed = "v0=" + hmac.new(
-        SLACK_SIGNING_SECRET.encode(),
+        signing_secret.encode(),
         sig_basestring.encode(),
         hashlib.sha256
     ).hexdigest()
