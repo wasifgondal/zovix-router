@@ -70,11 +70,13 @@ def route_with_claude(text, channel):
             "model": "claude-haiku-4-5-20251001",
             "max_tokens": 200,
             "system": """You route Slack messages for a video agency.
-Respond ONLY with JSON: {"destination": "EDITOR"|"WRITER"|"MANAGEMENT"|"SENSITIVE", "summary": "brief task summary"}
+Respond ONLY with JSON: {"destination": "EDITOR"|"WRITER"|"MANAGEMENT"|"SENSITIVE", "summary": "complete task summary"}
 EDITOR: video editing, captions, cuts, formats
 WRITER: scripts, hooks, copy, writing
 SENSITIVE: payments, invoices, pricing, contracts
-MANAGEMENT: everything else""",
+MANAGEMENT: everything else
+
+IMPORTANT: If the message contains multiple requests or edits (e.g. trim intro, fix captions, add watermark, change music, export formats), include EVERY one of them in the summary — do not shorten to just one item. If there are 3+ distinct requests, format the summary as a bullet list using • for each point. Do not drop any requested change, deadline, or detail the client mentioned.""",
             "messages": [{"role": "user", "content": f"Channel: #{channel}\nMessage: {text}"}]
         }
         resp = requests.post(
