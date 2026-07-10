@@ -5,25 +5,10 @@ import time
 import json
 import requests
 from flask import Flask, request, jsonify
-import anthropic
 
 app = Flask(__name__)
 
-# ── CONFIG ──────────────────────────────────────────────
-SLACK_BOT_TOKEN      = os.environ.get("SLACK_BOT_TOKEN")       # xoxb-...
-SLACK_SIGNING_SECRET = os.environ.get("SLACK_SIGNING_SECRET")  # from Basic Info
-ANTHROPIC_API_KEY    = os.environ.get("ANTHROPIC_API_KEY")     # sk-ant-...
-TELEGRAM_BOT_TOKEN   = os.environ.get("TELEGRAM_BOT_TOKEN")    # from BotFather
-
-# Telegram Group Chat IDs (negative numbers)
-TELEGRAM_EDITOR_GROUP     = os.environ.get("TELEGRAM_EDITOR_GROUP")     # -100...
-TELEGRAM_WRITER_GROUP     = os.environ.get("TELEGRAM_WRITER_GROUP")     # -100...
-TELEGRAM_MANAGEMENT_GROUP = os.environ.get("TELEGRAM_MANAGEMENT_GROUP") # -100...
-
-# ── CLIENTS ─────────────────────────────────────────────
-anthropic_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
-
-# ── SENSITIVE KEYWORDS (hard block — never forward) ─────
+# ── SENSITIVE KEYWORDS ───────────────────────────────────
 SENSITIVE_KEYWORDS = [
     "invoice", "payment", "paid", "pay", "bank", "transfer",
     "contract", "price", "pricing", "rate", "rates", "cost",
@@ -33,272 +18,147 @@ SENSITIVE_KEYWORDS = [
     "confidential", "private", "personal",
 ]
 
-def is_definitely_sensitive(text):
-    """Hard keyword check before even calling Claude."""
+# EDITOR keywords
+EDITOR_KEYWORDS = [
+    "edit", "editing", "cut", "trim", "footage", "video",
+    "caption", "subtitle", "music", "sound", "format",
+    "export", "render", "transition", "effect", "color",
+    "9:16", "1:1", "4:5", "reel", "short", "clip",
+]
+
+# WRITER keywords
+WRITER_KEYWORDS = [
+    "script", "write", "writing", "hook", "copy", "caption",
+    "content", "text", "draft", "story", "angle", "concept",
+    "headline", "ad copy", "voiceover", "narration",
+]
+
+def is_sensitive(text):
     text_lower = text.lower()
     return any(keyword in text_lower for keyword in SENSITIVE_KEYWORDS)
 
-# ── SLACK VERIFICATION ───────────────────────────────────
-def verify_slack_signature(request_body, timestamp, signature):
-    """Verify the request actually comes from Slack."""
-    signing_secret = os.environ.get("SLACK_SIGNING_SECRET", "")
-    if not signing_secret:
-        return True  # Skip verification if secret not set
-    if abs(time.time() - int(timestamp)) > 60 * 5:
-        return False
-    sig_basestring = f"v0:{timestamp}:{request_body}"
-    computed = "v0=" + hmac.new(
-        signing_secret.encode(),
-        sig_basestring.encode(),
-        hashlib.sha256
-    ).hexdigest()
-    return hmac.compare_digest(computed, signature)
+def route_by_keywords(text):
+    """Simple keyword-based routing without Claude."""
+    text_lower = text.lower()
+    
+    editor_score = sum(1 for k in EDITOR_KEYWORDS if k in text_lower)
+    writer_score = sum(1 for k in WRITER_KEYWORDS if k in text_lower)
+    
+    print(f"Editor score: {editor_score}, Writer score: {writer_score}")
+    
+    if editor_score == 0 and writer_score == 0:
+        return "MANAGEMENT"
+    elif editor_score >= writer_score:
+        return "EDITOR"
+    else:
+        return "WRITER"
 
-# ── TELEGRAM SENDER ──────────────────────────────────────
-def send_telegram(chat_id, message):
-    """Send a message to a Telegram group."""
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": chat_id,
-        "text": message,
-        "parse_mode": "HTML",
-    }
-    try:
-        response = requests.post(url, json=payload, timeout=10)
-        return response.json()
-    except Exception as e:
-        print(f"Telegram send error: {e}")
-        return None
-
-# ── CLAUDE ROUTER ────────────────────────────────────────
-def route_with_claude(message_text, channel_name):
-    """
-    Ask Claude to:
-    1. Classify the message
-    2. Extract the task cleanly
-    3. Decide which team gets it
-    """
-    system_prompt = """You are a smart message router for Zovix, a video ads agency.
-
-Your job is to read a Slack message from a client and:
-1. Decide if it contains sensitive information
-2. If it is a task, decide which team should handle it
-3. Extract ONLY the task-related content — strip all sensitive info
-
-SENSITIVE (never forward, mark as MANAGEMENT):
-- Payment, invoices, pricing, costs, rates, contracts
-- Salary, budget, billing, bank details
-- Personal opinions about team members
-- Confidential business information
-- Anything with $ £ € or currency symbols in a payment context
-
-EDITOR tasks (forward to EDITOR group):
-- Video editing requests
-- Adding captions, subtitles
-- Cutting footage, trimming videos
-- Adding music, sound design
-- Format changes (9:16, 1:1, 4:5)
-- Any video production task
-
-WRITER tasks (forward to WRITER group):
-- Script writing
-- Hook writing
-- Ad copy
-- Caption writing for posts
-- Content strategy
-- Any writing or scripting task
-
-MANAGEMENT (forward to management group only):
-- General questions not specific to a task
-- Approvals that need owner decision
-- Complaints or issues
-- Anything sensitive
-- Anything unclear
-
-Respond ONLY with valid JSON in this exact format:
-{
-  "destination": "EDITOR" | "WRITER" | "MANAGEMENT" | "SENSITIVE",
-  "task_summary": "Clean 1-2 sentence summary of the task only",
-  "priority": "URGENT" | "NORMAL" | "LOW",
-  "deadline": "extracted deadline or null",
-  "sensitive_detected": true | false,
-  "reason": "one line explaining your routing decision"
-}
-
-If SENSITIVE, set task_summary to null."""
-
-    user_prompt = f"""Client channel: #{channel_name}
-
-Client message:
-\"\"\"{message_text}\"\"\"""
-
-Analyze this message and respond with JSON only."""
+def route_with_claude(text, channel):
+    """Try Claude routing, fall back to keywords if it fails."""
+    api_key = os.environ.get("ANTHROPIC_API_KEY", "")
+    if not api_key:
+        print("No Claude API key — using keyword routing")
+        return route_by_keywords(text), text[:200]
 
     try:
-        response = anthropic_client.messages.create(
-            model="claude-sonnet-4-6",
-            max_tokens=500,
-            system=system_prompt,
-            messages=[{"role": "user", "content": user_prompt}]
-        )
-        raw = response.content[0].text.strip()
-        # Strip markdown code blocks if present
-        if raw.startswith("```"):
-            raw = raw.split("```")[1]
-            if raw.startswith("json"):
-                raw = raw[4:]
-        return json.loads(raw.strip())
-    except Exception as e:
-        print(f"Claude routing error: {e}")
-        # Default to management on any error
-        return {
-            "destination": "MANAGEMENT",
-            "task_summary": message_text[:200],
-            "priority": "NORMAL",
-            "deadline": None,
-            "sensitive_detected": False,
-            "reason": "Routing error — defaulted to management"
+        headers = {
+            "x-api-key": api_key,
+            "anthropic-version": "2023-06-01",
+            "content-type": "application/json",
         }
+        payload = {
+            "model": "claude-haiku-4-5-20251001",
+            "max_tokens": 200,
+            "system": """You route Slack messages for a video agency.
+Respond ONLY with JSON: {"destination": "EDITOR"|"WRITER"|"MANAGEMENT"|"SENSITIVE", "summary": "brief task summary"}
+EDITOR: video editing, captions, cuts, formats
+WRITER: scripts, hooks, copy, writing
+SENSITIVE: payments, invoices, pricing, contracts
+MANAGEMENT: everything else""",
+            "messages": [{"role": "user", "content": f"Channel: #{channel}\nMessage: {text}"}]
+        }
+        resp = requests.post(
+            "https://api.anthropic.com/v1/messages",
+            headers=headers,
+            json=payload,
+            timeout=10
+        )
+        data = resp.json()
+        print(f"Claude response: {data}")
+        
+        if "content" in data:
+            raw = data["content"][0]["text"].strip()
+            if raw.startswith("```"):
+                raw = raw.split("```")[1]
+                if raw.startswith("json"):
+                    raw = raw[4:]
+            result = json.loads(raw.strip())
+            return result.get("destination", "MANAGEMENT"), result.get("summary", text[:200])
+        else:
+            print(f"Claude error: {data}")
+            dest = route_by_keywords(text)
+            return dest, text[:200]
+    except Exception as e:
+        print(f"Claude routing failed: {e} — using keywords")
+        dest = route_by_keywords(text)
+        return dest, text[:200]
 
-# ── FORMAT MESSAGE FOR TELEGRAM ──────────────────────────
-def format_telegram_message(routing, channel_name, destination):
-    """Format a clean task card for Telegram."""
+# ── TELEGRAM ─────────────────────────────────────────────
+def send_telegram(chat_id, message):
+    token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+    if not token:
+        print(f"ERROR: No Telegram token. Would send to {chat_id}: {message}")
+        return
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    payload = {"chat_id": chat_id, "text": message, "parse_mode": "HTML"}
+    try:
+        resp = requests.post(url, json=payload, timeout=10)
+        print(f"Telegram response: {resp.json()}")
+    except Exception as e:
+        print(f"Telegram error: {e}")
 
-    priority_emoji = {
-        "URGENT": "🔴",
-        "NORMAL": "🟡",
-        "LOW":    "🟢"
-    }.get(routing.get("priority", "NORMAL"), "🟡")
-
-    team_label = {
-        "EDITOR":     "✂️ EDITOR TASK",
-        "WRITER":     "✍️ WRITER TASK",
-        "MANAGEMENT": "📋 MANAGEMENT",
-    }.get(destination, "📋 NEW TASK")
-
-    deadline_line = ""
-    if routing.get("deadline"):
-        deadline_line = f"\n⏰ <b>Deadline:</b> {routing['deadline']}"
-
-    message = (
-        f"{priority_emoji} <b>{team_label}</b>\n"
+def format_message(destination, channel, summary, priority="NORMAL"):
+    emoji = {"EDITOR": "✂️", "WRITER": "✍️", "MANAGEMENT": "📋"}.get(destination, "📋")
+    label = {"EDITOR": "EDITOR TASK", "WRITER": "WRITER TASK", "MANAGEMENT": "MANAGEMENT"}.get(destination, "NEW TASK")
+    priority_dot = {"URGENT": "🔴", "NORMAL": "🟡", "LOW": "🟢"}.get(priority, "🟡")
+    return (
+        f"{priority_dot} <b>{emoji} {label}</b>\n"
         f"━━━━━━━━━━━━━━━━━━━\n"
-        f"📁 <b>Client:</b> #{channel_name}\n"
-        f"📝 <b>Task:</b> {routing.get('task_summary', 'See Slack for details')}"
-        f"{deadline_line}\n"
+        f"📁 <b>Client:</b> #{channel}\n"
+        f"📝 <b>Task:</b> {summary}\n"
         f"━━━━━━━━━━━━━━━━━━━\n"
         f"<i>— Zovix System</i>"
     )
-    return message
 
-# ── MAIN SLACK ENDPOINT ──────────────────────────────────
-@app.route("/slack", methods=["POST"])
-def slack_events():
-    # Handle URL verification challenge from Slack
-    if request.content_type == "application/json":
-        data = request.get_json()
-        if data and data.get("type") == "url_verification":
-            return jsonify({"challenge": data["challenge"]})
-
-    # Verify Slack signature
-    timestamp = request.headers.get("X-Slack-Request-Timestamp", "")
-    signature = request.headers.get("X-Slack-Signature", "")
-    body_raw   = request.get_data(as_text=True)
-
-    if not verify_slack_signature(body_raw, timestamp, signature):
-        return jsonify({"error": "Invalid signature"}), 403
-
-    data = request.get_json()
-    if not data:
-        return jsonify({"ok": True})
-
-    # URL verification (form-encoded sometimes)
-    if data.get("type") == "url_verification":
-        return jsonify({"challenge": data["challenge"]})
-
-    # Process message events
-    event = data.get("event", {})
-
-    # Only process actual user messages (ignore bot messages)
-    if (event.get("type") == "message"
-            and not event.get("subtype")
-            and not event.get("bot_id")):
-
-        message_text = event.get("text", "").strip()
-        channel_id   = event.get("channel", "")
-
-        if not message_text or len(message_text) < 5:
-            return jsonify({"ok": True})
-
-        # Get channel name from Slack API
-        channel_name = get_channel_name(channel_id)
-
-        # Hard keyword check first (saves API calls)
-        if is_definitely_sensitive(message_text):
-            notify = (
-                f"🔒 <b>SENSITIVE MESSAGE BLOCKED</b>\n"
-                f"━━━━━━━━━━━━━━━━━━━\n"
-                f"📁 <b>Channel:</b> #{channel_name}\n"
-                f"⚠️ Message contained sensitive keywords\n"
-                f"📌 Check Slack for the full message\n"
-                f"━━━━━━━━━━━━━━━━━━━\n"
-                f"<i>— Zovix System</i>"
-            )
-            send_telegram(TELEGRAM_MANAGEMENT_GROUP, notify)
-            return jsonify({"ok": True})
-
-        # Use Claude for intelligent routing
-        routing = route_with_claude(message_text, channel_name)
-        destination = routing.get("destination", "MANAGEMENT")
-
-        # If sensitive detected by Claude
-        if destination == "SENSITIVE" or routing.get("sensitive_detected"):
-            notify = (
-                f"🔒 <b>SENSITIVE MESSAGE DETECTED</b>\n"
-                f"━━━━━━━━━━━━━━━━━━━\n"
-                f"📁 <b>Channel:</b> #{channel_name}\n"
-                f"⚠️ Claude detected sensitive content\n"
-                f"📌 Check Slack for the full message\n"
-                f"━━━━━━━━━━━━━━━━━━━\n"
-                f"<i>— Zovix System</i>"
-            )
-            send_telegram(TELEGRAM_MANAGEMENT_GROUP, notify)
-            return jsonify({"ok": True})
-
-        # Format and send to correct group
-        formatted = format_telegram_message(routing, channel_name, destination)
-
-        if destination == "EDITOR":
-            send_telegram(TELEGRAM_EDITOR_GROUP, formatted)
-        elif destination == "WRITER":
-            send_telegram(TELEGRAM_WRITER_GROUP, formatted)
-        else:
-            # MANAGEMENT or anything else
-            send_telegram(TELEGRAM_MANAGEMENT_GROUP, formatted)
-
-    return jsonify({"ok": True})
-
-# ── HEALTH CHECK ─────────────────────────────────────────
-@app.route("/", methods=["GET"])
-def health():
-    return jsonify({
-        "status": "running",
-        "service": "Zovix Slack → Telegram Router",
-        "version": "1.0"
-    })
+# ── SLACK VERIFICATION ────────────────────────────────────
+def verify_slack(body, timestamp, signature):
+    secret = os.environ.get("SLACK_SIGNING_SECRET", "")
+    if not secret:
+        print("No signing secret — skipping verification")
+        return True
+    try:
+        if abs(time.time() - int(timestamp)) > 300:
+            return False
+        base = f"v0:{timestamp}:{body}"
+        computed = "v0=" + hmac.new(
+            secret.encode(), base.encode(), hashlib.sha256
+        ).hexdigest()
+        return hmac.compare_digest(computed, signature)
+    except Exception as e:
+        print(f"Verification error: {e}")
+        return True
 
 # ── CHANNEL NAME CACHE ────────────────────────────────────
 channel_cache = {}
 
 def get_channel_name(channel_id):
-    """Get channel name from Slack API with caching."""
     if channel_id in channel_cache:
         return channel_cache[channel_id]
     try:
-        headers = {"Authorization": f"Bearer {SLACK_BOT_TOKEN}"}
+        token = os.environ.get("SLACK_BOT_TOKEN", "")
         resp = requests.get(
             f"https://slack.com/api/conversations.info?channel={channel_id}",
-            headers=headers,
+            headers={"Authorization": f"Bearer {token}"},
             timeout=5
         )
         data = resp.json()
@@ -307,10 +167,106 @@ def get_channel_name(channel_id):
             channel_cache[channel_id] = name
             return name
     except Exception as e:
-        print(f"Channel name fetch error: {e}")
+        print(f"Channel name error: {e}")
     return channel_id
 
-# ── RUN ───────────────────────────────────────────────────
+# ── MAIN SLACK ENDPOINT ───────────────────────────────────
+@app.route("/slack", methods=["POST"])
+def slack_events():
+    # Handle URL verification
+    if request.content_type and "json" in request.content_type:
+        data = request.get_json(silent=True)
+        if data and data.get("type") == "url_verification":
+            print("URL verification challenge received")
+            return jsonify({"challenge": data["challenge"]})
+
+    body_raw = request.get_data(as_text=True)
+    timestamp = request.headers.get("X-Slack-Request-Timestamp", "")
+    signature = request.headers.get("X-Slack-Signature", "")
+
+    if not verify_slack(body_raw, timestamp, signature):
+        print("Signature verification failed")
+        return jsonify({"error": "Invalid signature"}), 403
+
+    try:
+        data = json.loads(body_raw)
+    except:
+        return jsonify({"ok": True})
+
+    if data.get("type") == "url_verification":
+        return jsonify({"challenge": data["challenge"]})
+
+    event = data.get("event", {})
+    print(f"Event received: {event.get('type')} | subtype: {event.get('subtype')} | bot: {event.get('bot_id')}")
+
+    if (event.get("type") == "message"
+            and not event.get("subtype")
+            and not event.get("bot_id")):
+
+        text = event.get("text", "").strip()
+        channel_id = event.get("channel", "")
+        
+        print(f"Processing message: {text[:100]}")
+
+        if not text or len(text) < 3:
+            return jsonify({"ok": True})
+
+        channel_name = get_channel_name(channel_id)
+
+        # Check sensitive first
+        if is_sensitive(text):
+            msg = (
+                f"🔒 <b>SENSITIVE MESSAGE</b>\n"
+                f"━━━━━━━━━━━━━━━━━━━\n"
+                f"📁 Channel: #{channel_name}\n"
+                f"⚠️ Contains sensitive content\n"
+                f"📌 Check Slack directly\n"
+                f"━━━━━━━━━━━━━━━━━━━\n"
+                f"<i>— Zovix System</i>"
+            )
+            mgmt = os.environ.get("TELEGRAM_MANAGEMENT_GROUP", "")
+            print(f"Sending sensitive alert to management: {mgmt}")
+            send_telegram(mgmt, msg)
+            return jsonify({"ok": True})
+
+        # Route with Claude or keywords
+        destination, summary = route_with_claude(text, channel_name)
+        print(f"Routing to: {destination}")
+
+        formatted = format_message(destination, channel_name, summary)
+
+        editor_group = os.environ.get("TELEGRAM_EDITOR_GROUP", "")
+        writer_group = os.environ.get("TELEGRAM_WRITER_GROUP", "")
+        mgmt_group = os.environ.get("TELEGRAM_MANAGEMENT_GROUP", "")
+
+        print(f"Groups — Editor: {editor_group} | Writer: {writer_group} | Mgmt: {mgmt_group}")
+
+        if destination == "EDITOR":
+            send_telegram(editor_group, formatted)
+        elif destination == "WRITER":
+            send_telegram(writer_group, formatted)
+        else:
+            send_telegram(mgmt_group, formatted)
+
+    return jsonify({"ok": True})
+
+# ── HEALTH CHECK ──────────────────────────────────────────
+@app.route("/", methods=["GET"])
+def health():
+    return jsonify({
+        "status": "running",
+        "service": "Zovix Router",
+        "env_check": {
+            "slack_token": bool(os.environ.get("SLACK_BOT_TOKEN")),
+            "slack_secret": bool(os.environ.get("SLACK_SIGNING_SECRET")),
+            "anthropic": bool(os.environ.get("ANTHROPIC_API_KEY")),
+            "telegram_token": bool(os.environ.get("TELEGRAM_BOT_TOKEN")),
+            "editor_group": bool(os.environ.get("TELEGRAM_EDITOR_GROUP")),
+            "writer_group": bool(os.environ.get("TELEGRAM_WRITER_GROUP")),
+            "mgmt_group": bool(os.environ.get("TELEGRAM_MANAGEMENT_GROUP")),
+        }
+    })
+
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 3000))
     app.run(host="0.0.0.0", port=port, debug=False)
