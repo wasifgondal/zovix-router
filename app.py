@@ -38,7 +38,12 @@ def is_sensitive(text):
     return any(keyword in text_lower for keyword in SENSITIVE_KEYWORDS)
 
 def route_by_keywords(text):
-    """Simple keyword-based routing without Claude."""
+    """
+    Fallback keyword-based routing without Claude.
+    Returns a LIST of task dicts to support mixed messages,
+    e.g. a message with both editing and writing keywords
+    returns two separate tasks.
+    """
     text_lower = text.lower()
 
     editor_score = sum(1 for k in EDITOR_KEYWORDS if k in text_lower)
@@ -46,19 +51,29 @@ def route_by_keywords(text):
 
     print(f"Editor score: {editor_score}, Writer score: {writer_score}")
 
-    if editor_score == 0 and writer_score == 0:
-        return "MANAGEMENT"
-    elif editor_score >= writer_score:
-        return "EDITOR"
-    else:
-        return "WRITER"
+    tasks = []
+    if editor_score > 0:
+        tasks.append({"destination": "EDITOR", "summary": text[:200]})
+    if writer_score > 0:
+        tasks.append({"destination": "WRITER", "summary": text[:200]})
+
+    if not tasks:
+        tasks.append({"destination": "MANAGEMENT", "summary": text[:200]})
+
+    return tasks
 
 def route_with_claude(text, channel):
-    """Try Claude routing, fall back to keywords if it fails."""
+    """
+    Ask Claude to read the message and return a LIST of tasks.
+    A single message can contain multiple distinct tasks
+    (e.g. one editing request + one writing request) —
+    Claude should split them out rather than picking just one.
+    Falls back to keyword routing on any failure.
+    """
     api_key = os.environ.get("ANTHROPIC_API_KEY", "")
     if not api_key:
         print("No Claude API key — using keyword routing")
-        return route_by_keywords(text), text[:200]
+        return route_by_keywords(text)
 
     try:
         headers = {
@@ -70,20 +85,40 @@ def route_with_claude(text, channel):
             "model": "claude-haiku-4-5-20251001",
             "max_tokens": 500,
             "system": """You route Slack messages for a video agency.
-Respond ONLY with JSON: {"destination": "EDITOR"|"WRITER"|"MANAGEMENT"|"SENSITIVE", "summary": "complete task summary"}
-EDITOR: video editing, captions, cuts, formats
-WRITER: scripts, hooks, copy, writing
-SENSITIVE: payments, invoices, pricing, contracts
-MANAGEMENT: everything else
 
-IMPORTANT: If the message contains multiple requests or edits (e.g. trim intro, fix captions, add watermark, change music, export formats), include EVERY one of them in the summary — do not shorten to just one item. If there are 3+ distinct requests, format the summary as a bullet list using • for each point. Do not drop any requested change, deadline, or detail the client mentioned.""",
+A single message can contain MULTIPLE distinct tasks — for example, a
+client might ask for a video edit AND a new script in the same message.
+You must identify EVERY distinct task in the message and return one
+entry per task. Do not merge unrelated tasks into a single summary,
+and do not drop any task.
+
+Respond ONLY with valid JSON in this exact format:
+{
+  "tasks": [
+    {"destination": "EDITOR"|"WRITER"|"MANAGEMENT"|"SENSITIVE", "summary": "complete task summary"}
+  ]
+}
+
+Rules:
+- EDITOR: video editing, captions, cuts, formats, music/sound, exports
+- WRITER: scripts, hooks, ad copy, writing tasks
+- SENSITIVE: payments, invoices, pricing, contracts, anything financial
+- MANAGEMENT: general questions, approvals, complaints, anything unclear
+- If the message has 3+ points for the SAME destination, combine them
+  into one task for that destination with a bullet list (using •) in
+  the summary — do not omit any point.
+- If the message has tasks for DIFFERENT destinations (e.g. one editor
+  task and one writer task), return them as SEPARATE entries in the
+  "tasks" array so each team only sees their own task.
+- Always include every requested change, deadline, or detail the
+  client mentioned somewhere in the relevant task's summary.""",
             "messages": [{"role": "user", "content": f"Channel: #{channel}\nMessage: {text}"}]
         }
         resp = requests.post(
             "https://api.anthropic.com/v1/messages",
             headers=headers,
             json=payload,
-            timeout=10
+            timeout=15
         )
         data = resp.json()
         print(f"Claude response: {data}")
@@ -95,21 +130,26 @@ IMPORTANT: If the message contains multiple requests or edits (e.g. trim intro, 
                 if raw.startswith("json"):
                     raw = raw[4:]
             result = json.loads(raw.strip())
-            return result.get("destination", "MANAGEMENT"), result.get("summary", text[:200])
+            tasks = result.get("tasks", [])
+            if not tasks:
+                # Claude returned no tasks — fall back safely
+                return [{"destination": "MANAGEMENT", "summary": text[:200]}]
+            return tasks
         else:
             print(f"Claude error: {data}")
-            dest = route_by_keywords(text)
-            return dest, text[:200]
+            return route_by_keywords(text)
     except Exception as e:
         print(f"Claude routing failed: {e} — using keywords")
-        dest = route_by_keywords(text)
-        return dest, text[:200]
+        return route_by_keywords(text)
 
 # ── TELEGRAM ─────────────────────────────────────────────
 def send_telegram(chat_id, message):
     token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
     if not token:
         print(f"ERROR: No Telegram token. Would send to {chat_id}: {message}")
+        return
+    if not chat_id:
+        print("ERROR: No chat_id provided — skipping send")
         return
     url = f"https://api.telegram.org/bot{token}/sendMessage"
     payload = {"chat_id": chat_id, "text": message, "parse_mode": "HTML"}
@@ -215,7 +255,7 @@ def slack_events():
 
         channel_name = get_channel_name(channel_id)
 
-        # Check sensitive first
+        # Check sensitive first — hard block, never forwarded
         if is_sensitive(text):
             msg = (
                 f"🔒 <b>SENSITIVE MESSAGE</b>\n"
@@ -231,11 +271,9 @@ def slack_events():
             send_telegram(mgmt, msg)
             return jsonify({"ok": True})
 
-        # Route with Claude or keywords
-        destination, summary = route_with_claude(text, channel_name)
-        print(f"Routing to: {destination}")
-
-        formatted = format_message(destination, channel_name, summary)
+        # Route with Claude (or keyword fallback) — returns a LIST of tasks
+        tasks = route_with_claude(text, channel_name)
+        print(f"Tasks identified: {tasks}")
 
         editor_group = os.environ.get("TELEGRAM_EDITOR_GROUP", "")
         writer_group = os.environ.get("TELEGRAM_WRITER_GROUP", "")
@@ -243,12 +281,33 @@ def slack_events():
 
         print(f"Groups — Editor: {editor_group} | Writer: {writer_group} | Mgmt: {mgmt_group}")
 
-        if destination == "EDITOR":
-            send_telegram(editor_group, formatted)
-        elif destination == "WRITER":
-            send_telegram(writer_group, formatted)
-        else:
-            send_telegram(mgmt_group, formatted)
+        # Send a SEPARATE Telegram message for EACH task to its own group
+        for task in tasks:
+            destination = task.get("destination", "MANAGEMENT")
+            summary = task.get("summary", text[:200])
+
+            # Any task Claude flags as SENSITIVE also gets hard-blocked
+            if destination == "SENSITIVE":
+                msg = (
+                    f"🔒 <b>SENSITIVE MESSAGE</b>\n"
+                    f"━━━━━━━━━━━━━━━━━━━\n"
+                    f"📁 Channel: #{channel_name}\n"
+                    f"⚠️ Contains sensitive content\n"
+                    f"📌 Check Slack directly\n"
+                    f"━━━━━━━━━━━━━━━━━━━\n"
+                    f"<i>— Zovix System</i>"
+                )
+                send_telegram(mgmt_group, msg)
+                continue
+
+            formatted = format_message(destination, channel_name, summary)
+
+            if destination == "EDITOR":
+                send_telegram(editor_group, formatted)
+            elif destination == "WRITER":
+                send_telegram(writer_group, formatted)
+            else:
+                send_telegram(mgmt_group, formatted)
 
     return jsonify({"ok": True})
 
