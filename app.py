@@ -40,12 +40,12 @@ def is_sensitive(text):
 def route_by_keywords(text):
     """Simple keyword-based routing without Claude."""
     text_lower = text.lower()
-    
+
     editor_score = sum(1 for k in EDITOR_KEYWORDS if k in text_lower)
     writer_score = sum(1 for k in WRITER_KEYWORDS if k in text_lower)
-    
+
     print(f"Editor score: {editor_score}, Writer score: {writer_score}")
-    
+
     if editor_score == 0 and writer_score == 0:
         return "MANAGEMENT"
     elif editor_score >= writer_score:
@@ -68,10 +68,7 @@ def route_with_claude(text, channel):
         }
         payload = {
             "model": "claude-haiku-4-5-20251001",
-            except Exception as e:
-    print(f"Claude routing failed: {e} — using keywords")
-    dest = route_by_keywords(text)
-    return dest, text[:200]
+            "max_tokens": 500,
             "system": """You route Slack messages for a video agency.
 Respond ONLY with JSON: {"destination": "EDITOR"|"WRITER"|"MANAGEMENT"|"SENSITIVE", "summary": "complete task summary"}
 EDITOR: video editing, captions, cuts, formats
@@ -90,7 +87,7 @@ IMPORTANT: If the message contains multiple requests or edits (e.g. trim intro, 
         )
         data = resp.json()
         print(f"Claude response: {data}")
-        
+
         if "content" in data:
             raw = data["content"][0]["text"].strip()
             if raw.startswith("```"):
@@ -210,7 +207,7 @@ def slack_events():
 
         text = event.get("text", "").strip()
         channel_id = event.get("channel", "")
-        
+
         print(f"Processing message: {text[:100]}")
 
         if not text or len(text) < 3:
