@@ -68,7 +68,10 @@ def route_with_claude(text, channel):
         }
         payload = {
             "model": "claude-haiku-4-5-20251001",
-            "max_tokens": 200,
+            except Exception as e:
+    print(f"Claude routing failed: {e} — using keywords")
+    dest = route_by_keywords(text)
+    return dest, text[:200]
             "system": """You route Slack messages for a video agency.
 Respond ONLY with JSON: {"destination": "EDITOR"|"WRITER"|"MANAGEMENT"|"SENSITIVE", "summary": "complete task summary"}
 EDITOR: video editing, captions, cuts, formats
